@@ -25,6 +25,11 @@ struct ServerDashboardView: View {
     @State private var autoScrollLogs: Bool = true
     @State private var selectedTab: DashboardTab = .dashboard
     @State private var autoStart: Bool = true
+    @AppStorage("apiKey") private var currentAPIKey: String = ""
+    @State private var customAPIKey: String = ""
+    @State private var apiKeyStatusMessage: String = ""
+    @State private var apiKeyStatusIsError: Bool = false
+    @State private var isSavingAPIKey: Bool = false
     @State private var metrics: MetricsSnapshot = MetricsSnapshot(
         totalRequests: 0, totalInferenceRequests: 0,
         totalTokens: 0, requestsLast5Min: 0,
@@ -59,11 +64,11 @@ struct ServerDashboardView: View {
                             serverStatsCard
                         }
 
-                        // Remote Access Card
-                        remoteAccessCard
-
                         // Server Controls Card
                         serverControlsCard
+
+                        // API Key Card
+                        apiKeyCard
 
                         // Xcode Integration Card
                         xcodeIntegrationCard
@@ -296,34 +301,6 @@ struct ServerDashboardView: View {
                         .accessibilityHint("Copies the base URL details to the clipboard")
                     }
 
-                    // Web pairing details
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Perspective Intelligence Web")
-                            .font(.subheadline.weight(.semibold))
-                            .foregroundColor(.primary)
-
-                        HStack(spacing: 8) {
-                            Label("Pairing Code: \(serverController.pairingCode)", systemImage: "link.badge.plus")
-                                .font(.system(size: 13, design: .monospaced))
-                                .foregroundColor(.orange)
-
-                            Button(action: {
-                                copyToClipboard(serverController.pairingCode, message: "Pairing code copied")
-                            }) {
-                                Image(systemName: "doc.on.doc")
-                                    .font(.caption)
-                                    .foregroundColor(.secondary)
-                            }
-                            .buttonStyle(.plain)
-                            .accessibilityLabel(copiedAccessibilityLabel(defaultLabel: "Copy pairing code", copiedLabel: "Pairing code copied", copiedMessage: "Pairing code copied"))
-                            .accessibilityValue(copiedAccessibilityValue(copiedMessage: "Pairing code copied"))
-                            .accessibilityHint("Copies the 6-digit pairing code for connecting from the web app")
-                        }
-                        Text("Use this code to connect from Perspective Intelligence Web. Go to Settings in the web app, choose Pairing Code, and enter these 6 digits. Your conversations stay on this Mac.")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
                 }
             }
 
@@ -367,65 +344,83 @@ struct ServerDashboardView: View {
                 .stroke(serverController.isRunning ? successColor.opacity(0.3) : Color(NSColor.separatorColor), lineWidth: 1)
         )
     }
-    
-    // MARK: - Remote Access Card
 
-    private var remoteAccessCard: some View {
+    private var loadedAdapterCount: Int {
+        FoundationModelAdapterRegistry.loadRecords().count
+    }
+
+    private var modelSummaryText: String {
+        let count = loadedAdapterCount
+        if count == 0 {
+            return "apple.local:latest"
+        }
+        return "apple.local:latest + \(count) adapter\(count == 1 ? "" : "s")"
+    }
+
+    // MARK: - API Key Card
+
+    private var apiKeyCard: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack {
-                Label("Remote Access", systemImage: "network")
+                Label("API Key", systemImage: "key.horizontal.fill")
                     .font(.headline)
                     .foregroundColor(.primary)
                 Spacer()
+
+                Button(action: {
+                    copyToClipboard(currentAPIKey, message: "API key copied")
+                }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "doc.on.doc")
+                            .accessibilityHidden(true)
+                        Text("Copy Key")
+                    }
+                    .font(.caption.weight(.medium))
+                    .foregroundColor(.accentColor)
+                }
+                .buttonStyle(.plain)
+                .disabled(currentAPIKey.isEmpty)
+                .accessibilityLabel(copiedAccessibilityLabel(defaultLabel: "Copy API key", copiedLabel: "API key copied", copiedMessage: "API key copied"))
+                .accessibilityValue(copiedAccessibilityValue(copiedMessage: "API key copied"))
             }
 
             Divider()
 
-            Toggle(isOn: Binding(
-                get: { serverController.relayEnabled },
-                set: { serverController.setRelayEnabled($0) }
-            )) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Enable remote access")
-                        .font(.subheadline.weight(.medium))
-                    Text("Let Perspective Intelligence Web connect to this server so you can chat from any browser, anywhere. Your Mac does the AI processing.")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
+            Text("Set this to the same API key used by Hermes, OpenClaw, Pi, or any OpenAI-compatible client.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Current API key")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Text(currentAPIKey.isEmpty ? "No API key saved yet." : currentAPIKey)
+                    .font(.system(size: 12, design: .monospaced))
+                    .foregroundStyle(currentAPIKey.isEmpty ? .secondary : .primary)
+                    .textSelection(.enabled)
             }
-            .disabled(!serverController.isRunning)
-            .accessibilityLabel("Enable remote access")
-            .accessibilityHint(serverController.isRunning
-                ? "Connects this server to Perspective Intelligence Web for remote browser access"
-                : "Start the server first to enable remote access")
-            .accessibilityValue(serverController.relayEnabled ? "Enabled" : "Disabled")
 
-            if serverController.relayEnabled {
-                HStack(spacing: 14) {
-                    Circle()
-                        .fill(relayIndicatorColor)
-                        .frame(width: 12, height: 12)
-                        .shadow(color: relayIndicatorColor.opacity(0.6), radius: 4)
-                        .accessibilityHidden(true)
+            HStack(spacing: 10) {
+                SecureField("Set API key", text: $customAPIKey)
+                    .textFieldStyle(.roundedBorder)
+                    .accessibilityLabel("API key")
+                    .accessibilityHint("Enter the API key clients should send")
 
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(relayStatusText)
-                            .font(.subheadline.weight(.medium))
-                            .foregroundColor(.primary)
-                        Text(relayStatusDetail)
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-
-                    Spacer()
+                Button("Save") {
+                    saveAPIKey()
                 }
-                .padding(12)
-                .background(Color(NSColor.textBackgroundColor))
-                .cornerRadius(10)
-                .accessibilityElement(children: .combine)
-                .accessibilityLabel("Relay status: \(relayStatusText). \(relayStatusDetail)")
+                .disabled(isSavingAPIKey || LocalHTTPServer.authTokenValidationMessage(for: customAPIKey) != nil)
+
+                Button("Generate") {
+                    generateAPIKey()
+                }
+                .disabled(isSavingAPIKey)
+            }
+
+            if !apiKeyStatusMessage.isEmpty {
+                Text(apiKeyStatusMessage)
+                    .font(.caption)
+                    .foregroundStyle(apiKeyStatusIsError ? .red : .green)
             }
         }
         .padding(20)
@@ -435,35 +430,6 @@ struct ServerDashboardView: View {
             RoundedRectangle(cornerRadius: 16)
                 .stroke(Color(NSColor.separatorColor), lineWidth: 1)
         )
-    }
-
-    private var relayIndicatorColor: Color {
-        switch serverController.relayStatus {
-        case .paired: return successColor
-        case .waitingForPairing: return .orange
-        case .connecting, .waitingForAuth: return .yellow
-        case .error: return errorColor
-        case .disconnected: return .gray
-        }
-    }
-
-    private var relayStatusText: String {
-        serverController.relayStatus.displayText
-    }
-
-    private var relayStatusDetail: String {
-        switch serverController.relayStatus {
-        case .disconnected:
-            return "Not connected to the cloud relay."
-        case .connecting, .waitingForAuth:
-            return "Connecting to Perspective Intelligence Web..."
-        case .waitingForPairing:
-            return "Ready. Go to Perspective Intelligence Web, open Settings, choose Pairing Code, and enter: \(serverController.pairingCode)"
-        case .paired:
-            return "A browser is connected and chatting through this Mac. Everything's running locally."
-        case .error(let msg):
-            return msg
-        }
     }
 
     // MARK: - Server Controls Card
@@ -588,10 +554,10 @@ struct ServerDashboardView: View {
                     .accessibilityHidden(true)
                 
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Model: apple.local:latest")
-                        .font(.system(size: 14, weight: .medium, design: .monospaced))
+                    Text("Models")
+                        .font(.system(size: 14, weight: .medium))
                         .foregroundColor(.primary)
-                    Text("Apple Intelligence on-device model")
+                    Text(modelSummaryText)
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
@@ -656,11 +622,11 @@ struct ServerDashboardView: View {
                 instructionRow(number: 1, text: "Open Xcode > Settings > Intelligence")
                 instructionRow(number: 2, text: "Click Add a Model Provider > Locally Hosted")
                 instructionRow(number: 3, text: "Enter port: \(localPort)")
-                instructionRow(number: 4, text: "Select apple.local:latest from the model list")
+                instructionRow(number: 4, text: loadedAdapterCount == 0 ? "Select apple.local:latest from the model list" : "Select apple.local:latest or an adapter model")
                 
                 HStack(spacing: 12) {
                     infoBox(title: "Port", value: localPort, icon: "network")
-                    infoBox(title: "Model", value: "apple.local:latest", icon: "cube")
+                    infoBox(title: "Models", value: "\(loadedAdapterCount + 1) available", icon: "cube")
                     infoBox(title: "Protocol", value: "Ollama API", icon: "arrow.left.arrow.right")
                 }
                 .padding(.top, 8)
@@ -830,7 +796,7 @@ struct ServerDashboardView: View {
                     accessibilityLabel: copiedAccessibilityLabel(defaultLabel: "Copy cURL, Test command", copiedLabel: "cURL command copied", copiedMessage: "cURL command copied"),
                     accessibilityValue: copiedAccessibilityValue(copiedMessage: "cURL command copied"),
                     action: {
-                        let token = loadBearerToken()
+                        let token = loadStoredAPIKey()
                         let cmd = token.isEmpty
                             ? "curl http://127.0.0.1:\(serverController.port)/api/tags"
                             : "curl -H \"Authorization: Bearer \(token)\" http://127.0.0.1:\(serverController.port)/api/tags"
@@ -1214,6 +1180,7 @@ struct ServerDashboardView: View {
     }
     
     private func copyToClipboard(_ text: String, message: String) {
+        guard !text.isEmpty else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
         copiedText = message
@@ -1221,6 +1188,61 @@ struct ServerDashboardView: View {
         
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
             showCopiedToast = false
+        }
+    }
+
+    private func saveAPIKey() {
+        let token = LocalHTTPServer.normalizedAuthToken(customAPIKey)
+        if let validationMessage = LocalHTTPServer.authTokenValidationMessage(for: token) {
+            apiKeyStatusMessage = validationMessage
+            apiKeyStatusIsError = true
+            return
+        }
+
+        isSavingAPIKey = true
+        Task {
+            do {
+                try await LocalHTTPServer.shared.setAuthToken(token)
+                await MainActor.run {
+                    currentAPIKey = token
+                    customAPIKey = ""
+                    apiKeyStatusMessage = "API key saved. Update Hermes or other clients to use this same value."
+                    apiKeyStatusIsError = false
+                    isSavingAPIKey = false
+                    AppLog.info("API key saved from dashboard", source: "auth")
+                }
+            } catch {
+                await MainActor.run {
+                    apiKeyStatusMessage = error.localizedDescription
+                    apiKeyStatusIsError = true
+                    isSavingAPIKey = false
+                    AppLog.error("API key save failed: \(error.localizedDescription)", source: "auth")
+                }
+            }
+        }
+    }
+
+    private func generateAPIKey() {
+        isSavingAPIKey = true
+        Task {
+            do {
+                let token = try await LocalHTTPServer.shared.rotateAuthToken()
+                await MainActor.run {
+                    currentAPIKey = token
+                    customAPIKey = ""
+                    apiKeyStatusMessage = "Generated a new API key. Update Hermes or other clients before using them again."
+                    apiKeyStatusIsError = false
+                    isSavingAPIKey = false
+                    AppLog.info("API key generated from dashboard", source: "auth")
+                }
+            } catch {
+                await MainActor.run {
+                    apiKeyStatusMessage = error.localizedDescription
+                    apiKeyStatusIsError = true
+                    isSavingAPIKey = false
+                    AppLog.error("API key generation failed: \(error.localizedDescription)", source: "auth")
+                }
+            }
         }
     }
     
@@ -1275,11 +1297,10 @@ struct ServerDashboardView: View {
         }
     }
 
-    // Protected API routes require the configured bearer token.
+    // Protected API routes require the configured API key.
 
-    private func loadBearerToken() -> String {
-        ((try? String(contentsOf: LocalHTTPServer.tokenFileURL, encoding: .utf8)) ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+    private func loadStoredAPIKey() -> String {
+        currentAPIKey
     }
 
     private func isCopied(_ copiedMessage: String) -> Bool {
@@ -1303,10 +1324,12 @@ struct ServerDashboardView: View {
             lines.append("OpenAI Base URL: \(fullURL)")
         }
 
-        let token = loadBearerToken()
+        let token = loadStoredAPIKey()
         if token.isEmpty {
-            lines.append("Authorization: Bearer <read token from \(LocalHTTPServer.tokenFileURL.path)>")
+            lines.append("API Key: <set one in afm-server Settings>")
+            lines.append("Authorization: Bearer <API key>")
         } else {
+            lines.append("API Key: \(token)")
             lines.append("Authorization: Bearer \(token)")
         }
 

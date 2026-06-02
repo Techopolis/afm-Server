@@ -11,32 +11,12 @@ struct ServerApp: App {
                 Text("afm-server")
                     .font(.headline)
 
-                Text("Runs AI models on your Mac so you can chat privately from any browser. No cloud required.")
+                Text("Runs AI models on your Mac for private local clients. No cloud required.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
 
                 Divider()
-
-                // Pairing code — always visible
-                if serverController.isRunning && !serverController.pairingCode.isEmpty {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Web Pairing Code")
-                            .font(.subheadline.weight(.medium))
-                        Text(serverController.pairingCode)
-                            .font(.system(.largeTitle, design: .monospaced).bold())
-                            .foregroundStyle(.orange)
-                            .textSelection(.enabled)
-                        Text("Enter this in Perspective Intelligence Web to connect your browser to this Mac.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    .accessibilityElement(children: .combine)
-                    .accessibilityLabel("Web pairing code: \(serverController.pairingCode.map(String.init).joined(separator: " ")). Enter this in Perspective Intelligence Web to connect.")
-
-                    Divider()
-                }
 
                 ServerStatusView()
                     .environmentObject(serverController)
@@ -56,35 +36,11 @@ struct ServerApp: App {
 final class ServerController: ObservableObject {
     @Published var isRunning: Bool = false
     @Published var port: UInt16 = 11434
-    @Published var pairingCode: String = ""
     @Published var errorMessage: String? = nil
-    @Published var relayEnabled: Bool = UserDefaults.standard.bool(forKey: "relayEnabled")
-    @Published var relayStatus: RelayStatus = .disconnected
 
     init() {
         AppLog.info("ServerController initialized", source: "server")
         start()
-        Task {
-            await RelayClient.shared.setStatusCallback { [weak self] status in
-                Task { @MainActor [weak self] in
-                    self?.relayStatus = status
-                    switch status {
-                    case .disconnected:
-                        AppLog.info("Relay disconnected", source: "relay")
-                    case .connecting:
-                        AppLog.info("Relay connecting", source: "relay")
-                    case .waitingForAuth:
-                        AppLog.info("Relay waiting for auth", source: "relay")
-                    case .waitingForPairing:
-                        AppLog.info("Relay authenticated, waiting for pairing", source: "relay")
-                    case .paired(let userId):
-                        AppLog.info("Relay paired with user \(userId)", source: "relay")
-                    case .error(let message):
-                        AppLog.error("Relay error: \(message)", source: "relay")
-                    }
-                }
-            }
-        }
     }
 
     func start() {
@@ -97,17 +53,12 @@ final class ServerController: ObservableObject {
             try? await Task.sleep(nanoseconds: 300_000_000)
             let running = await LocalHTTPServer.shared.getIsRunning()
             let error = await LocalHTTPServer.shared.getLastError()
-            let code = await LocalHTTPServer.shared.pairingCode
             self.isRunning = running
             self.errorMessage = error
-            self.pairingCode = code
             if running {
                 AppLog.info("Server started on port \(self.port)", source: "server")
             } else if let error {
                 AppLog.error("Server failed to start: \(error)", source: "server")
-            }
-            if running && self.relayEnabled {
-                await RelayClient.shared.connect()
             }
         }
     }
@@ -115,7 +66,6 @@ final class ServerController: ObservableObject {
     func stop() {
         AppLog.info("Server stop requested", source: "server")
         Task {
-            await RelayClient.shared.disconnect()
             await LocalHTTPServer.shared.stop()
             let running = await LocalHTTPServer.shared.getIsRunning()
             self.isRunning = running
@@ -128,24 +78,18 @@ final class ServerController: ObservableObject {
         errorMessage = nil
         AppLog.info("Server restart requested on port \(port)", source: "server")
         Task {
-            await RelayClient.shared.disconnect()
             await LocalHTTPServer.shared.stop()
             await LocalHTTPServer.shared.setPort(port)
             await LocalHTTPServer.shared.start()
             try? await Task.sleep(nanoseconds: 300_000_000)
             let running = await LocalHTTPServer.shared.getIsRunning()
             let error = await LocalHTTPServer.shared.getLastError()
-            let code = await LocalHTTPServer.shared.pairingCode
             self.isRunning = running
             self.errorMessage = error
-            self.pairingCode = code
             if running {
                 AppLog.info("Server restarted on port \(self.port)", source: "server")
             } else if let error {
                 AppLog.error("Server failed to restart: \(error)", source: "server")
-            }
-            if running && relayEnabled {
-                await RelayClient.shared.connect()
             }
         }
     }
@@ -155,26 +99,9 @@ final class ServerController: ObservableObject {
             let running = await LocalHTTPServer.shared.getIsRunning()
             let serverPort = await LocalHTTPServer.shared.getPort()
             let error = await LocalHTTPServer.shared.getLastError()
-            let code = await LocalHTTPServer.shared.pairingCode
-            let currentRelayStatus = await RelayClient.shared.status
             self.isRunning = running
             self.port = serverPort
             self.errorMessage = error
-            self.pairingCode = code
-            self.relayStatus = currentRelayStatus
-        }
-    }
-
-    func setRelayEnabled(_ enabled: Bool) {
-        relayEnabled = enabled
-        UserDefaults.standard.set(enabled, forKey: "relayEnabled")
-        AppLog.info("Remote relay \(enabled ? "enabled" : "disabled")", source: "relay")
-        Task {
-            if enabled && isRunning {
-                await RelayClient.shared.connect()
-            } else if !enabled {
-                await RelayClient.shared.disconnect()
-            }
         }
     }
 }

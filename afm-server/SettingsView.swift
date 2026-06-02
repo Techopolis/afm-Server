@@ -22,8 +22,8 @@ struct SettingsView: View {
     @AppStorage("debugLogging") private var debugLogging: Bool = false
     @AppStorage("includeHistory") private var includeHistory: Bool = true
     @AppStorage("enableBetaUpdates") private var enableBetaUpdates: Bool = false
-    @State private var currentBearerToken: String = ""
-    @State private var customBearerToken: String = ""
+    @AppStorage("apiKey") private var currentAPIKey: String = ""
+    @State private var customAPIKey: String = ""
     @State private var tokenStatusMessage: String = ""
     @State private var tokenStatusIsError: Bool = false
     @State private var isSavingToken: Bool = false
@@ -70,8 +70,12 @@ struct SettingsView: View {
                 }
             }
 
-            Section(header: Text("API Bearer Token")) {
-                apiBearerTokenControls
+            Section(header: Text("API Key")) {
+                apiKeyControls
+            }
+
+            Section(header: Text("Foundation Model Adapters")) {
+                FoundationModelAdapterSettingsView()
             }
 
             Text("The system prompt (if enabled) is sent with each chat to guide the assistant's behavior.")
@@ -111,54 +115,58 @@ struct SettingsView: View {
                     }
                 }
 
-                card(title: "API Bearer Token", systemImage: "key.horizontal") {
-                    apiBearerTokenControls
+                card(title: "API Key", systemImage: "key.horizontal") {
+                    apiKeyControls
+                }
+
+                card(title: "Foundation Model Adapters", systemImage: "shippingbox") {
+                    FoundationModelAdapterSettingsView()
                 }
             }
             .padding(.vertical, 4)
         }
     }
 
-    private var apiBearerTokenControls: some View {
+    private var apiKeyControls: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("Requests to local API endpoints must include this token in the Authorization header.")
+            Text("OpenAI-compatible clients use this value as their API key. afm-server accepts it as `Authorization: Bearer <API key>`.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
 
             VStack(alignment: .leading, spacing: 4) {
-                Text("Current token")
+                Text("Current API key")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
-                Text(currentBearerToken.isEmpty ? "No token saved yet." : currentBearerToken)
+                Text(currentAPIKey.isEmpty ? "No API key saved yet." : currentAPIKey)
                     .font(.system(size: 12, design: .monospaced))
                     .textSelection(.enabled)
-                    .foregroundStyle(currentBearerToken.isEmpty ? .secondary : .primary)
+                    .foregroundStyle(currentAPIKey.isEmpty ? .secondary : .primary)
             }
 
-            SecureField("Custom bearer token", text: $customBearerToken)
+            SecureField("Set API key", text: $customAPIKey)
                 .textFieldStyle(.roundedBorder)
-                .accessibilityLabel("Custom bearer token")
-                .accessibilityHint("Enter a bearer token with more than 4 characters")
+                .accessibilityLabel("API key")
+                .accessibilityHint("Enter the API key Hermes, OpenClaw, Pi, or another client should use")
 
-            Text("Use any token more than 4 characters. Leading and trailing spaces are ignored.")
+            Text("Use any stable value longer than 4 characters. Set the same value in Hermes, OpenClaw, Pi, or any OpenAI-compatible client.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
             HStack {
-                Button("Save Token") {
-                    saveCustomBearerToken()
+                Button("Save API Key") {
+                    saveCustomAPIKey()
                 }
-                .disabled(isSavingToken || LocalHTTPServer.authTokenValidationMessage(for: customBearerToken) != nil)
+                .disabled(isSavingToken || LocalHTTPServer.authTokenValidationMessage(for: customAPIKey) != nil)
 
-                Button("Generate Token") {
-                    rotateBearerToken()
+                Button("Generate API Key") {
+                    rotateAPIKey()
                 }
                 .disabled(isSavingToken)
 
-                Button("Copy Token") {
-                    copyBearerToken()
+                Button("Copy API Key") {
+                    copyAPIKey()
                 }
-                .disabled(currentBearerToken.isEmpty)
+                .disabled(currentAPIKey.isEmpty)
             }
 
             if !tokenStatusMessage.isEmpty {
@@ -166,9 +174,6 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(tokenStatusIsError ? .red : .green)
             }
-        }
-        .task {
-            await loadBearerToken()
         }
     }
 
@@ -188,8 +193,8 @@ struct SettingsView: View {
         )
     }
 
-    private func saveCustomBearerToken() {
-        let token = LocalHTTPServer.normalizedAuthToken(customBearerToken)
+    private func saveCustomAPIKey() {
+        let token = LocalHTTPServer.normalizedAuthToken(customAPIKey)
         if let validationMessage = LocalHTTPServer.authTokenValidationMessage(for: token) {
             tokenStatusMessage = validationMessage
             tokenStatusIsError = true
@@ -201,9 +206,9 @@ struct SettingsView: View {
             do {
                 try await LocalHTTPServer.shared.setAuthToken(token)
                 await MainActor.run {
-                    currentBearerToken = token
-                    customBearerToken = ""
-                    tokenStatusMessage = "Bearer token saved."
+                    currentAPIKey = token
+                    customAPIKey = ""
+                    tokenStatusMessage = "API key saved."
                     tokenStatusIsError = false
                     isSavingToken = false
                 }
@@ -217,15 +222,15 @@ struct SettingsView: View {
         }
     }
 
-    private func rotateBearerToken() {
+    private func rotateAPIKey() {
         isSavingToken = true
         Task {
             do {
                 let token = try await LocalHTTPServer.shared.rotateAuthToken()
                 await MainActor.run {
-                    currentBearerToken = token
-                    customBearerToken = ""
-                    tokenStatusMessage = "Generated a new bearer token."
+                    currentAPIKey = token
+                    customAPIKey = ""
+                    tokenStatusMessage = "Generated a new API key."
                     tokenStatusIsError = false
                     isSavingToken = false
                 }
@@ -239,17 +244,12 @@ struct SettingsView: View {
         }
     }
 
-    @MainActor
-    private func loadBearerToken() async {
-        currentBearerToken = await LocalHTTPServer.shared.getAuthToken() ?? ""
-    }
-
-    private func copyBearerToken() {
-        guard !currentBearerToken.isEmpty else { return }
+    private func copyAPIKey() {
+        guard !currentAPIKey.isEmpty else { return }
         #if os(macOS)
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(currentBearerToken, forType: .string)
-        tokenStatusMessage = "Bearer token copied."
+        NSPasteboard.general.setString(currentAPIKey, forType: .string)
+        tokenStatusMessage = "API key copied."
         tokenStatusIsError = false
         #endif
     }

@@ -7,6 +7,9 @@
 
 import Foundation
 import OSLog
+#if canImport(Darwin)
+import Darwin
+#endif
 
 #if canImport(FoundationModels)
 import FoundationModels
@@ -19,7 +22,7 @@ import FoundationModels
 nonisolated final class FileToolsManager: @unchecked Sendable {
     static let shared = FileToolsManager()
     
-    private let logger = Logger(subsystem: "com.example.PerspectiveIntelligence", category: "FileTools")
+    private let logger = Logger(subsystem: "online.techopolis.afm-server", category: "FileTools")
     private let fm = FileManager.default
     
     /// The allowed root directories for file operations.
@@ -76,6 +79,25 @@ nonisolated final class FileToolsManager: @unchecked Sendable {
     /// Resolves a path to an absolute URL, handling ~ expansion and relative paths
     func resolvePath(_ path: String) -> URL {
         var resolvedPath = path
+        let trimmedPath = resolvedPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lowerPath = trimmedPath.lowercased()
+        let developerExactMatches = ["developer", "~/developer", "~/desktop/developer"]
+        let developerPrefixes = ["developer/", "~/developer/", "~/desktop/developer/"]
+
+        for prefix in developerExactMatches where lowerPath == prefix {
+            let developerURL = fm.homeDirectoryForCurrentUser.appendingPathComponent("Developer")
+            return developerURL.standardized
+        }
+
+        for prefix in developerPrefixes where lowerPath.hasPrefix(prefix) {
+            let suffixStart = trimmedPath.index(trimmedPath.startIndex, offsetBy: min(prefix.count, trimmedPath.count))
+            let suffix = String(trimmedPath[suffixStart...]).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            var developerURL = fm.homeDirectoryForCurrentUser.appendingPathComponent("Developer")
+            if !suffix.isEmpty {
+                developerURL.appendPathComponent(suffix)
+            }
+            return developerURL.standardized
+        }
         
         // Expand ~ to home directory
         if resolvedPath.hasPrefix("~/") {
@@ -447,6 +469,106 @@ nonisolated struct PathCheckResult: Codable, Sendable {
     let size: Int?
 }
 
+nonisolated struct TerminalCommandResult: Codable, Sendable {
+    let command: String
+    let workingDirectory: String
+    let exitCode: Int32?
+    let timedOut: Bool
+    let durationSeconds: Double
+    let output: String
+    let truncated: Bool
+    let fullOutputPath: String?
+}
+
+nonisolated enum TerminalCommandRunner {
+    private static let maxOutputBytes = 64 * 1024
+
+    static func run(command: String, workingDirectory: URL, timeoutSeconds: Int) async throws -> TerminalCommandResult {
+        try await Task.detached(priority: .utility) {
+            let timeout = min(max(timeoutSeconds, 1), 120)
+            let fm = FileManager.default
+            let outputURL = fm.temporaryDirectory
+                .appendingPathComponent("afm-terminal-\(UUID().uuidString).log")
+
+            fm.createFile(atPath: outputURL.path, contents: nil)
+            let outputHandle = try FileHandle(forWritingTo: outputURL)
+            defer {
+                try? outputHandle.close()
+            }
+
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+            process.arguments = ["-lc", command]
+            process.currentDirectoryURL = workingDirectory
+            process.standardOutput = outputHandle
+            process.standardError = outputHandle
+
+            let startedAt = Date()
+            try process.run()
+
+            let deadline = Date().addingTimeInterval(TimeInterval(timeout))
+            var timedOut = false
+
+            while process.isRunning {
+                if Date() >= deadline {
+                    timedOut = true
+                    process.terminate()
+                    break
+                }
+                try await Task.sleep(nanoseconds: 50_000_000)
+            }
+
+            if timedOut {
+                let killDeadline = Date().addingTimeInterval(2)
+                while process.isRunning && Date() < killDeadline {
+                    try await Task.sleep(nanoseconds: 50_000_000)
+                }
+                #if canImport(Darwin)
+                if process.isRunning {
+                    kill(process.processIdentifier, SIGKILL)
+                }
+                #endif
+            }
+
+            process.waitUntilExit()
+            try? outputHandle.close()
+
+            let duration = Date().timeIntervalSince(startedAt)
+            let attrs = try? fm.attributesOfItem(atPath: outputURL.path)
+            let fileSize = attrs?[.size] as? UInt64 ?? 0
+            let truncated = fileSize > UInt64(maxOutputBytes)
+            let outputData: Data
+
+            let readHandle = try FileHandle(forReadingFrom: outputURL)
+            defer {
+                try? readHandle.close()
+            }
+
+            if truncated {
+                try readHandle.seek(toOffset: fileSize - UInt64(maxOutputBytes))
+                outputData = readHandle.readDataToEndOfFile()
+            } else {
+                outputData = readHandle.readDataToEndOfFile()
+                try? fm.removeItem(at: outputURL)
+            }
+
+            let output = String(data: outputData, encoding: .utf8)
+                ?? String(decoding: outputData, as: UTF8.self)
+
+            return TerminalCommandResult(
+                command: command,
+                workingDirectory: workingDirectory.path,
+                exitCode: timedOut ? nil : process.terminationStatus,
+                timedOut: timedOut,
+                durationSeconds: duration,
+                output: output.isEmpty ? "(no output)" : output,
+                truncated: truncated,
+                fullOutputPath: truncated ? outputURL.path : nil
+            )
+        }.value
+    }
+}
+
 // MARK: - Foundation Models Tool Definitions
 
 #if canImport(FoundationModels)
@@ -492,7 +614,7 @@ nonisolated struct WriteFileTool: Tool {
     
     func call(arguments: Arguments) async throws -> String {
         // Log that the tool was called
-        let logger = Logger(subsystem: "com.example.PerspectiveIntelligence", category: "WriteFileTool")
+        let logger = Logger(subsystem: "online.techopolis.afm-server", category: "WriteFileTool")
         logger.log("[WriteFileTool] CALLED with path=\(arguments.path, privacy: .public)")
         
         let result = try FileToolsManager.shared.writeFile(
@@ -594,11 +716,11 @@ nonisolated struct MoveFileTool: Tool {
 @available(iOS 26.0, macOS 26.0, visionOS 26.0, *)
 nonisolated struct ListDirectoryTool: Tool {
     let name = "list_directory"
-    let description = "List contents of a directory"
+    let description = "List contents of a local directory. Use ~/Developer for the user's Developer folder."
     
     @Generable
     struct Arguments {
-        @Guide(description: "The absolute path to the directory")
+        @Guide(description: "Directory path, such as ~/Developer or ~/Downloads")
         let path: String
         
         @Guide(description: "If true, list recursively (default false)")
@@ -654,6 +776,42 @@ nonisolated struct CheckPathTool: Tool {
     func call(arguments: Arguments) async throws -> String {
         let result = try FileToolsManager.shared.checkPath(path: arguments.path)
         let encoder = JSONEncoder()
+        let data = try encoder.encode(result)
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+}
+
+@available(iOS 26.0, macOS 26.0, visionOS 26.0, *)
+nonisolated struct BashTerminalTool: Tool {
+    let name = "bash"
+    let description = "Execute a short local terminal command and return stdout plus stderr. Use this for real local facts, repo checks, git status, ls, rg, find, build, and test commands."
+
+    @Generable
+    struct Arguments {
+        @Guide(description: "The shell command to execute, such as pwd, ls -la ~/Developer, git status --short, or rg -n pattern")
+        let command: String
+
+        @Guide(description: "Working directory for the command. Use ~/Developer or a project path when relevant. Defaults to the user's home directory.")
+        let workingDirectory: String?
+
+        @Guide(description: "Timeout in seconds. Defaults to 10 and is capped at 120.")
+        let timeoutSeconds: Int?
+    }
+
+    func call(arguments: Arguments) async throws -> String {
+        let cwd = try FileToolsManager.shared.validatePath(arguments.workingDirectory ?? "~")
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: cwd.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+            throw FileToolsManager.FileToolError.isNotDirectory(cwd.path)
+        }
+
+        let result = try await TerminalCommandRunner.run(
+            command: arguments.command,
+            workingDirectory: cwd,
+            timeoutSeconds: arguments.timeoutSeconds ?? 10
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .prettyPrinted
         let data = try encoder.encode(result)
         return String(data: data, encoding: .utf8) ?? ""
     }

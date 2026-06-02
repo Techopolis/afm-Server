@@ -15,7 +15,7 @@ Built by [Techopolis](https://techopolisonline.com).
 - **Guardrail Recovery**: Automatic session eviction on safety violations prevents refusal spirals — a single bad message does not poison the entire conversation
 - **Soft Refusal Detection**: Detects when the model returns a refusal as normal text (not an exception) and resets the session to keep follow-up messages working
 - **Concurrency Control**: Configurable semaphore limits concurrent inference calls (default 3) with FIFO queuing for additional requests
-- **Tool Calling**: File system tools (read, write, edit, delete, move, list directory, create directory, check path)
+- **Tool Calling**: OpenAI-compatible delegated tool calls for agent harnesses, plus server-local file and terminal tools for built-in/local requests
 - **Auto-Updates**: Sparkle 2 checks for updates daily and shows a dock badge when one is available
 - **Privacy First**: All processing happens on-device — no data leaves your Mac
 
@@ -358,7 +358,7 @@ For comparison, you can also configure cloud-hosted models in Xcode 26 Intellige
 
 Visit [OpenRouter.ai](https://openrouter.ai) to get an API key that provides access to models from Anthropic, OpenAI, Google, and others through a single endpoint.
 
-However, afm-server offers the advantage of completely local, private AI assistance without requiring API keys or incurring usage costs.
+However, afm-server offers the advantage of completely local, private AI assistance without cloud API keys or usage costs. The local server still uses a user-configurable API key to protect its loopback endpoints.
 
 ### Cursor IDE
 
@@ -392,26 +392,38 @@ Any application that supports custom OpenAI API endpoints can use afm-server:
 
 - Set the API base URL to `http://127.0.0.1:11435/v1`
 - Use `apple.local` as the model name
-- API key is not required (but can be set to any value if the client requires it)
+- Set the client API key to the value shown in afm-server Settings or the dashboard API Key card
+- afm-server accepts that key as `Authorization: Bearer <API key>`
 
 ## Tool Calling
 
-The server supports tool calling for file operations within a sandboxed workspace:
+afm-server supports two tool paths:
 
-### Available Tools
+### Client-Delegated Tools
 
-- `read_file`: Read file contents
-- `write_file`: Create or write content to a file
-- `edit_file`: Modify a file by replacing text
-- `delete_file`: Remove a file
-- `move_file`: Move or rename a file
-- `list_directory`: List directory contents
-- `create_directory`: Create new directories
-- `check_path`: Check if a path exists and get its type
+When an OpenAI-compatible client sends a `tools` array to `POST /v1/chat/completions`, afm-server behaves like a model backend. It can return an assistant message with `tool_calls` and `finish_reason: "tool_calls"`. The connecting client, such as Pi, Hermes, OpenClaw, or another coding harness, is responsible for executing those tools on the client machine and sending the results back as `role: "tool"` messages.
+
+This is the correct path for agentic coding work because the harness owns the workspace, terminal, approvals, and tool registry.
+
+Streaming requests also emit OpenAI-style `delta.tool_calls` chunks so clients that keep `stream: true` can still see tool calls.
+
+### Server-Local Tools
+
+When no client tools are provided, afm-server can use Apple Foundation Models native Swift tools for local file and terminal requests. These tools run inside the afm-server process on the Mac hosting the server:
+
+- `bash`: Execute a short shell command on the server Mac
+- `read_file`: Read file contents on the server Mac
+- `write_file`: Create or write content to a file on the server Mac
+- `edit_file`: Modify a file by replacing text on the server Mac
+- `delete_file`: Remove a file on the server Mac
+- `move_file`: Move or rename a file on the server Mac
+- `list_directory`: List directory contents on the server Mac
+- `create_directory`: Create new directories on the server Mac
+- `check_path`: Check if a path exists and get its type on the server Mac
 
 ### Workspace Configuration
 
-Set the `PI_WORKSPACE_ROOT` environment variable to specify the root directory for file operations. If not set, it defaults to your Documents folder.
+Set the `PI_WORKSPACE_ROOT` environment variable to specify the root directory for server-local file operations. If not set, it defaults to your Documents folder.
 
 ```bash
 export PI_WORKSPACE_ROOT=/path/to/your/workspace

@@ -27,36 +27,15 @@ actor LocalHTTPServer {
     //
     // Security model:
     // 1. Loopback-only binding keeps the server local to this Mac.
-    // 2. Bearer token auth is required for non-preflight API requests.
+    // 2. A user-configurable API key is required for non-preflight API requests.
     // 3. Host, origin, and client allowlists are optional policy layers and
     //    are not required to use the local API.
 
-    /// Bearer token required for all non-preflight requests.
+    /// API key accepted through the OpenAI-compatible Authorization header for all non-preflight requests.
     private var authToken: String?
 
     static let minimumAuthTokenLength = 5
-
-    private static let tokenDirectory: URL = {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        return appSupport.appendingPathComponent("afm-server")
-    }()
-
-    static let tokenFileURL: URL = {
-        tokenDirectory.appendingPathComponent("auth_token")
-    }()
-
-    // MARK: - Pairing
-
-    /// 6-digit pairing code for connecting the web app to this server.
-    /// Generated on each server start. User enters it in the web app to pair.
-    private(set) var pairingCode: String = ""
-
-    /// Generate a random 6-digit pairing code.
-    private func generatePairingCode() {
-        pairingCode = String(format: "%06d", Int.random(in: 0...999999))
-        logger.log("Pairing code generated: \(self.pairingCode, privacy: .public)")
-        AppLog.info("Generated new pairing code", source: "server")
-    }
+    static let authTokenDefaultsKey = "apiKey"
 
     private init() {}
 
@@ -83,10 +62,10 @@ actor LocalHTTPServer {
     nonisolated static func authTokenValidationMessage(for token: String) -> String? {
         let normalized = normalizedAuthToken(token)
         guard normalized.count >= minimumAuthTokenLength else {
-            return "Token must be more than 4 characters."
+            return "API key must be more than 4 characters."
         }
         guard normalized.rangeOfCharacter(from: .newlines) == nil else {
-            return "Token cannot contain line breaks."
+            return "API key cannot contain line breaks."
         }
         return nil
     }
@@ -96,19 +75,17 @@ actor LocalHTTPServer {
     }
 
     private func loadOrCreateAuthToken() throws {
-        if let storedToken = try Self.readStoredAuthToken(),
-           Self.isValidAuthToken(storedToken) {
+        if let storedToken = Self.readAuthTokenFromUserDefaults() {
             authToken = storedToken
-            logger.log("Loaded auth token from \(Self.tokenFileURL.path, privacy: .public)")
-            AppLog.info("Loaded API bearer token", source: "auth")
+            logger.log("Loaded API key from UserDefaults")
+            AppLog.info("Loaded API key", source: "auth")
             return
         }
 
         try generateAndStoreToken()
     }
 
-    /// Generate a cryptographic auth token and write it to disk.
-    /// Local applications can read the file; web pages cannot.
+    /// Generate a cryptographic API key and store it in UserDefaults.
     @discardableResult
     private func generateAndStoreToken() throws -> String {
         let token = UUID().uuidString
@@ -128,34 +105,36 @@ actor LocalHTTPServer {
 
         authToken = nil
 
-        let fm = FileManager.default
-        try fm.createDirectory(at: Self.tokenDirectory, withIntermediateDirectories: true)
-        try normalizedToken.write(to: Self.tokenFileURL, atomically: true, encoding: .utf8)
-        // Restrict file permissions to owner-only (0600)
-        try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: Self.tokenFileURL.path)
-
-        let persistedToken = try String(contentsOf: Self.tokenFileURL, encoding: .utf8)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard persistedToken == normalizedToken else {
+        Self.writeAuthTokenToUserDefaults(normalizedToken)
+        guard Self.readAuthTokenFromUserDefaults() == normalizedToken else {
             throw NSError(
                 domain: "LocalHTTPServer",
                 code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "Persisted auth token did not match generated token"]
+                userInfo: [NSLocalizedDescriptionKey: "Persisted API key did not match saved value"]
             )
         }
 
         authToken = normalizedToken
 
-        logger.log("Auth token written to \(Self.tokenFileURL.path, privacy: .public)")
-        AppLog.info("API bearer token saved", source: "auth")
+        logger.log("API key saved to UserDefaults")
+        AppLog.info("API key saved", source: "auth")
     }
 
-    private nonisolated static func readStoredAuthToken() throws -> String? {
-        guard FileManager.default.fileExists(atPath: tokenFileURL.path) else {
+    nonisolated static func readStoredAuthToken() -> String? {
+        readAuthTokenFromUserDefaults()
+    }
+
+    private nonisolated static func readAuthTokenFromUserDefaults() -> String? {
+        guard let token = UserDefaults.standard.string(forKey: authTokenDefaultsKey)
+            .map(normalizedAuthToken),
+              isValidAuthToken(token) else {
             return nil
         }
-        return try String(contentsOf: tokenFileURL, encoding: .utf8)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return token
+    }
+
+    private nonisolated static func writeAuthTokenToUserDefaults(_ token: String) {
+        UserDefaults.standard.set(token, forKey: authTokenDefaultsKey)
     }
 
     nonisolated private static func corsOrigin(for origin: String?) -> String {
@@ -171,12 +150,12 @@ actor LocalHTTPServer {
         return headers
     }
 
-    /// Return the current auth token (for UI display / copy-to-clipboard).
+    /// Return the current API key (for UI display / copy-to-clipboard).
     func getAuthToken() -> String? {
         if let authToken {
             return authToken
         }
-        return try? Self.readStoredAuthToken()
+        return Self.readStoredAuthToken()
     }
 
     func setAuthToken(_ token: String) throws {
@@ -197,14 +176,13 @@ actor LocalHTTPServer {
             return
         }
         lastError = nil
-        generatePairingCode()
         do {
             try loadOrCreateAuthToken()
         } catch {
             authToken = nil
-            lastError = "Failed to persist auth token: \(error.localizedDescription)"
+            lastError = "Failed to persist API key: \(error.localizedDescription)"
             logger.error("\(self.lastError ?? "")")
-            AppLog.error(lastError ?? "Failed to persist auth token", source: "auth")
+            AppLog.error(lastError ?? "Failed to persist API key", source: "auth")
             return
         }
         // Build port list: configured port first, then fallbacks (deduped)
@@ -274,7 +252,7 @@ actor LocalHTTPServer {
         let origin = request.headers["origin"]
         let corsOrigin = Self.corsOrigin(for: origin)
 
-        // CORS preflight support (no auth token required for preflight)
+        // CORS preflight support (no API key required for preflight)
         if request.method == "OPTIONS" {
             return .normal(HTTPResponse(status: 204, headers: [
                 "Access-Control-Allow-Origin": corsOrigin,
@@ -284,54 +262,15 @@ actor LocalHTTPServer {
             ], body: Data()))
         }
 
-        // --- Pairing endpoint ---
-        // POST /pair/verify { "code": "123456" }
-        // Returns 200 with server info and the configured API token if the code matches.
-        let rawPath = request.path.split(separator: "?").first.map(String.init) ?? request.path
-        if request.method == "POST" && rawPath == "/pair/verify" {
-            let currentCode = await self.pairingCode
-            guard !currentCode.isEmpty else {
-                AppLog.warning("Pairing requested while pairing is unavailable", source: "pairing")
-                let msg = ["error": ["message": "Pairing not available"]]
-                let data = (try? JSONSerialization.data(withJSONObject: msg, options: [])) ?? Data()
-                return .normal(HTTPResponse(status: 503, headers: Self.jsonHeaders(corsOrigin: corsOrigin), body: data))
-            }
-
-            // Parse the submitted code
-            var submittedCode = ""
-            if let json = try? JSONSerialization.jsonObject(with: request.bodyData) as? [String: Any],
-               let code = json["code"] as? String {
-                submittedCode = code.trimmingCharacters(in: .whitespaces)
-            }
-
-            if submittedCode == currentCode {
-                AppLog.info("Pairing code verified", source: "pairing")
-                let serverPort = await self.port
-                let obj: [String: Any] = [
-                    "paired": true,
-                    "port": serverPort,
-                    "server": "afm-server",
-                    "apiToken": await self.getAuthToken() ?? "",
-                ]
-                let data = (try? JSONSerialization.data(withJSONObject: obj, options: [])) ?? Data()
-                return .normal(HTTPResponse(status: 200, headers: Self.jsonHeaders(corsOrigin: corsOrigin), body: data))
-            } else {
-                AppLog.warning("Invalid pairing code rejected", source: "pairing")
-                let msg = ["error": ["message": "Invalid pairing code"]]
-                let data = (try? JSONSerialization.data(withJSONObject: msg, options: [])) ?? Data()
-                return .normal(HTTPResponse(status: 403, headers: Self.jsonHeaders(corsOrigin: corsOrigin), body: data))
-            }
-        }
-
-        // Bearer token is the required API access control. Hosts, origins, and
+        // API key bearer auth is the required API access control. Hosts, origins, and
         // client allowlists are optional policy layers and are not required here.
         if let token = await self.authToken {
             let authHeader = request.headers["authorization"] ?? request.headers["Authorization"] ?? ""
             let provided = authHeader.hasPrefix("Bearer ") ? String(authHeader.dropFirst(7)) : ""
             if provided != token {
-                logger.warning("[req:\(rid, privacy: .public)] Blocked: invalid or missing auth token")
-                AppLog.warning("Blocked request with invalid or missing bearer token", source: "auth")
-                let msg = ["error": ["message": "Unauthorized: invalid or missing bearer token. Token is stored at \(Self.tokenFileURL.path)"]]
+                logger.warning("[req:\(rid, privacy: .public)] Blocked: invalid or missing API key")
+                AppLog.warning("Blocked request with invalid or missing API key", source: "auth")
+                let msg = ["error": ["message": "Unauthorized: invalid or missing API key. Set or copy the API key in afm-server Settings."]]
                 let data = (try? JSONSerialization.data(withJSONObject: msg, options: [])) ?? Data()
                 return .normal(HTTPResponse(status: 401, headers: Self.jsonHeaders(corsOrigin: corsOrigin), body: data))
             }
@@ -529,11 +468,37 @@ actor LocalHTTPServer {
             return .normal(resp)
         }
 
-        // Ollama-compatible: POST /api/chat (non-streaming)
+        // Ollama-compatible: POST /api/chat
         if request.method == "POST" && path == "/api/chat" {
             do {
                 let decoder = JSONDecoder()
                 let req = try decoder.decode(FoundationModelsService.OllamaChatRequest.self, from: request.bodyData)
+                if req.stream == true {
+                    return .stream(HTTPStreamResponse.ndjson(origin: corsOrigin, handler: { emitter in
+                        let respObj = try await FoundationModelsService.shared.handleOllamaChat(req)
+                        logger.log("[req:\(rid, privacy: .public)] /api/chat streaming model=\(respObj.model, privacy: .public)")
+
+                        for chunk in StreamChunker.chunk(text: respObj.message.content) {
+                            let event: [String: Any] = [
+                                "model": respObj.model,
+                                "created_at": respObj.created_at,
+                                "message": [
+                                    "role": respObj.message.role,
+                                    "content": chunk
+                                ],
+                                "done": false
+                            ]
+                            try await emitter.emitNDJSON(json: event)
+                        }
+
+                        let final: [String: Any] = [
+                            "model": respObj.model,
+                            "created_at": ISO8601DateFormatter().string(from: Date()),
+                            "done": true
+                        ]
+                        try await emitter.emitNDJSON(json: final)
+                    }))
+                }
                 let respObj = try await FoundationModelsService.shared.handleOllamaChat(req)
                 let data = try JSONEncoder().encode(respObj)
                 logger.log("[req:\(rid, privacy: .public)] /api/chat ok model=\(respObj.model, privacy: .public) msgLen=\(respObj.message.content.count)")
@@ -724,33 +689,64 @@ actor LocalHTTPServer {
                 let req = try decoder.decode(ChatCompletionRequest.self, from: request.bodyData)
                 if req.stream == true {
                     return .stream(HTTPStreamResponse.sse(origin: corsOrigin, handler: { emitter in
-                        let hasTools: Bool = {
-                            if let data = String(data: request.bodyData, encoding: .utf8)?.lowercased() {
-                                return data.contains("\"tools\"") && !data.contains("\"tools\": []")
-                            }
-                            return false
-                        }()
+                        let hasTools = !(req.tools?.isEmpty ?? true)
                         let useMulti = (!hasTools) && (req.multi_segment == true)
 
                         let streamId = "chatcmpl_" + UUID().uuidString.replacingOccurrences(of: "-", with: "")
                         let created = Int(Date().timeIntervalSince1970)
                         var resolvedSessionID: String? = nil
+                        var finalFinishReason = "stop"
 
                         if hasTools {
-                            // Tools path: generate full response then chunk it
-                            logger.log("[req:\(rid, privacy: .public)] /v1/chat/completions streaming mode=tools-fallback")
+                            // Tools path: delegate OpenAI-compatible tool_calls back to the client harness.
+                            logger.log("[req:\(rid, privacy: .public)] /v1/chat/completions streaming mode=tools")
                             do {
                                 let resp = try await FoundationModelsService.shared.handleChatCompletion(req)
-                                let full = resp.choices.first?.message.content ?? ""
-                                for chunk in StreamChunker.chunk(text: full) {
+                                let choice = resp.choices.first
+                                finalFinishReason = choice?.finish_reason ?? "stop"
+                                let toolCalls = choice?.message.tool_calls ?? []
+
+                                if !toolCalls.isEmpty {
+                                    let roleEvent: [String: Any] = [
+                                        "id": streamId,
+                                        "object": "chat.completion.chunk",
+                                        "created": created,
+                                        "model": req.model,
+                                        "choices": [["index": 0, "delta": ["role": "assistant"]]]
+                                    ]
+                                    try? await emitter.emitSSE(json: roleEvent)
+
+                                    let streamedToolCalls: [[String: Any]] = toolCalls.enumerated().map { index, call in
+                                        [
+                                            "index": index,
+                                            "id": call.id,
+                                            "type": call.type,
+                                            "function": [
+                                                "name": call.function.name,
+                                                "arguments": call.function.arguments
+                                            ]
+                                        ]
+                                    }
                                     let event: [String: Any] = [
                                         "id": streamId,
                                         "object": "chat.completion.chunk",
                                         "created": created,
                                         "model": req.model,
-                                        "choices": [["index": 0, "delta": ["content": chunk]]]
+                                        "choices": [["index": 0, "delta": ["tool_calls": streamedToolCalls]]]
                                     ]
                                     try? await emitter.emitSSE(json: event)
+                                } else {
+                                    let full = choice?.message.content ?? ""
+                                    for chunk in StreamChunker.chunk(text: full) {
+                                        let event: [String: Any] = [
+                                            "id": streamId,
+                                            "object": "chat.completion.chunk",
+                                            "created": created,
+                                            "model": req.model,
+                                            "choices": [["index": 0, "delta": ["content": chunk]]]
+                                        ]
+                                        try? await emitter.emitSSE(json: event)
+                                    }
                                 }
                             } catch {
                                 logger.error("[req:\(rid, privacy: .public)] tools streaming error: \(String(describing: error), privacy: .public)")
@@ -829,7 +825,7 @@ actor LocalHTTPServer {
                             "object": "chat.completion.chunk",
                             "created": created,
                             "model": req.model,
-                            "choices": [["index": 0, "delta": [:], "finish_reason": "stop"]]
+                            "choices": [["index": 0, "delta": [:], "finish_reason": finalFinishReason]]
                         ]
                         if let sid = resolvedSessionID {
                             finalEvent["session_id"] = sid
@@ -870,13 +866,22 @@ actor LocalHTTPServer {
     // MARK: - Actor-isolated helpers
 
     private func handleListenerState(_ state: NWListener.State, currentPort: UInt16) async {
+        let isStalePortEvent = currentPort != port
         switch state {
         case .ready:
+            guard !isStalePortEvent else {
+                logger.log("Ignoring stale ready event for port \(currentPort); active port is \(self.port)")
+                return
+            }
             logger.log("HTTP server listening on localhost:\(currentPort) (loopback only)")
             AppLog.info("HTTP server listening on localhost:\(currentPort)", source: "server")
             isRunning = true
             lastError = nil
         case .failed(let error):
+            guard !isStalePortEvent else {
+                logger.log("Ignoring stale failure event for port \(currentPort); active port is \(self.port)")
+                return
+            }
             let isAddressInUse: Bool
             if let posixError = error as? NWError,
                case .posix(let code) = posixError,
@@ -895,12 +900,12 @@ actor LocalHTTPServer {
             // If address is in use, try the next port
             if isAddressInUse {
                 currentPortIndex += 1
-                if currentPortIndex < fallbackPorts.count {
+                if currentPortIndex < portsToTry.count {
                     logger.log("Port \(currentPort) in use, trying next port...")
                     AppLog.warning("Port \(currentPort) in use; trying next port", source: "server")
                     await tryStartOnNextPort()
                 } else {
-                    lastError = "All ports in use. Tried: \(fallbackPorts.map(String.init).joined(separator: ", "))"
+                    lastError = "All ports in use. Tried: \(portsToTry.map(String.init).joined(separator: ", "))"
                     logger.error("\(self.lastError ?? "")")
                     AppLog.error(lastError ?? "All ports in use", source: "server")
                 }
@@ -909,6 +914,10 @@ actor LocalHTTPServer {
                 AppLog.error(lastError ?? "Server failed", source: "server")
             }
         case .cancelled:
+            guard !isStalePortEvent else {
+                logger.log("Ignoring stale cancel event for port \(currentPort); active port is \(self.port)")
+                return
+            }
             logger.log("Listener cancelled")
             AppLog.info("Listener cancelled", source: "server")
             isRunning = false

@@ -78,7 +78,7 @@ struct AFMServerApp: App {
     #endif
     
     init() {
-        // Server auto-starts on launch via the MenuBarExtra .task modifier
+        // Server auto-starts on launch via ServerController.
     }
     
     var body: some Scene {
